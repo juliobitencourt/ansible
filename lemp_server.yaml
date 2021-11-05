@@ -1,0 +1,186 @@
+---
+- hosts: all
+  become: true
+  vars:
+    papertrail_installer: /tmp/papertrail_installer.sh
+    installer: /tmp/installer.php
+    create_user: deployer
+    copy_local_key: "{{ lookup('file', lookup('env','HOME') + '/.ssh/****.pub') }}"
+    ssh_key_filename: 
+    github_user: 
+  vars_prompt:
+    - name: mysql_root_password
+      prompt: What is the MySQL root password?
+      unsafe: yes
+
+    - name: redis_password
+      prompt: What is the Redis password?
+      unsafe: yes
+
+  tasks:
+    # Ubuntu settings
+    - name: Make sure we have a 'wheel' group
+      group:
+        name: wheel
+        state: present
+
+    - name: Allow 'wheel' group to have passwordless sudo
+      lineinfile:
+        path: /etc/sudoers
+        state: present
+        regexp: '^%wheel'
+        line: '%wheel ALL=(ALL) NOPASSWD: ALL'
+        validate: '/usr/sbin/visudo -cf %s'
+
+    - name: Create a new regular user with sudo privileges
+      user:
+        name: "{{ create_user }}"
+        state: present
+        groups: wheel
+        append: true
+        create_home: true
+        shell: /bin/bash
+
+    - name: Set authorized key for remote user
+      authorized_key:
+        user: "{{ create_user }}"
+        state: present
+        key: "{{ copy_local_key }}"
+
+    - name: Disable password authentication for root
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        state: present
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin prohibit-password'
+
+    - name: Add Ondrej PPA Repository
+      ansible.builtin.apt_repository:
+        repo: ppa:ondrej/php
+
+    - name: Install Packages
+      apt: name={{ item }} update_cache=yes state=latest
+      loop: [ 'awscli', 'python3-pip', 'net-tools', 'nginx', 'php', 'php-cli', 'php-fpm', 'mysql-server', 'redis-server', 'python3-certbot-nginx', 'supervisor' ]
+      tags: [ 'packages' ]
+
+    - name: Install PHP Dependencies
+      apt: name={{ item }} update_cache=yes state=latest
+      loop: [ 'openssl', 'php-curl', 'php-dev', 'php-bcmath', 'php-sqlite3', 'php-mysql', 'php-json', 'php-mbstring', 'php-pear', 'php-xml', 'php-zip', 'php-intl' ]
+      tags: [ 'php-dependencies' ]
+
+    # - name: Install PHP Redis extension
+    #   community.general.pear:
+    #     name: pecl/phpredis
+    #     state: present
+    #   tags: [ 'redis' ]
+
+    - name: Copy index page
+      copy:
+        src: index.html
+        dest: /var/www/html/index.html
+        owner: www-data
+        group: www-data
+        mode: '0644'
+      tags: [ 'update', 'sync' ]
+
+    # MySQL Configuration
+    - name: Make sure pymysql is present
+      pip:
+        name: pymysql
+        state: present
+      tags: [ 'mysql' ]
+
+    - name: Sets the root password
+      mysql_user:
+        name: root
+        password: "{{ mysql_root_password }}"
+        plugin: auth_socket
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+      tags: [ 'mysql' ]
+
+    - name: Create an user
+      mysql_user:
+        name: deployer
+        password: ""
+        state: absent
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+      tags: [ 'mysql' ]
+
+    - name: Removes all anonymous user accounts
+      become: true
+      become_user: ubuntu
+      mysql_user:
+        name: ''
+        host_all: yes
+        state: absent
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+      tags: [ 'mysql-remove-users' ]
+
+    # - name: Removes the MySQL test database
+    #   mysql_db:
+    #     name: test
+    #     state: absent
+    #     login_user: root
+    #     login_password: "{{ mysql_root_password }}"
+
+    # curl -sSk https://getcomposer.org/installer -o /tmp/composer-installer.php
+    - name: Download composer
+      get_url:
+        url: https://getcomposer.org/installer
+        dest: "{{ installer }}"
+      tags:
+        - composer
+
+    # php /tmp/composer-installer.php
+    # sudo mv composer.phar /usr/local/bin/composer
+    - name: Install composer
+      command: "{{ item }}"
+      with_items:
+        - "php {{ installer }}"
+        - mv composer.phar /usr/local/bin/composer
+      tags:
+        - composer
+
+    # sudo rm /tmp/composer-installer.php
+    - name: Remove composer installer
+      file:
+        path: "{{ installer }}"
+        state: absent
+      tags:
+        - composer
+
+    - name: Change Redis supervised configuration
+      lineinfile:
+        path: /etc/redis/redis.conf
+        state: present
+        regexp: '^#?supervised'
+        line: 'supervised systemd'
+
+    - name: Change redis password
+      lineinfile:
+        path: /etc/redis/redis.conf
+        state: present
+        regexp: '^#? ?requirepass'
+        line: 'requirepass {{ redis_password }}'
+
+    - name: Ensure redis service is restarted
+      service: name=redis state=restarted
+
+    - name: generate SSH key "{{ssh_key_filename}}"
+      become_user: ubuntu
+      openssh_keypair:
+        comment: "{{github_user}}"
+        path: "~/.ssh/{{ssh_key_filename}}"
+        type: ed25519
+        state: present
+        force: yes
+      tags:
+        - ssh
+
+    - name: Set Letsencrypt Cronjob for Certificate Auto Renewal
+      cron:
+        name: letsencrypt_renewal
+        special_time: monthly
+        job: "/usr/bin/certbot renew"
+      when: ansible_facts['os_family'] == "Debian"
